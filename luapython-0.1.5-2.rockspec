@@ -18,7 +18,6 @@ dependencies = {
 build = {
 	type = "make",
 	build_variables = {
-		LUA_VERSION = "$(LUA_VERSION)",
 		LUA_INCDIR = "$(LUA_INCDIR)",
 	},
 	install_variables = {

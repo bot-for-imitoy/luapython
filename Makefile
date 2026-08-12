@@ -61,6 +61,7 @@ install:
 	cp $(TARGET) $(INSTALL_LIBDIR)/luapython/core.so
 	cp loader.so $(INSTALL_LIBDIR)/luapython/loader.so
 	cp luapython/*.lua $(INSTALL_LUADIR)/luapython
+	rm -f $(INSTALL_LUADIR)/luapython/configure.lua
 
 uninstall:
 	rm -rf $(INSTALL_LUADIR)/luapython
