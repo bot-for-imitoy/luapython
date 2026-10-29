@@ -449,9 +449,13 @@ int python_index(lua_State* L) {
 /* __eq shared by every container/object metatable. Without it Lua compares
  * userdata by reference, so two equal Python lists compared unequal. */
 int python_object_eq(lua_State* L) {
-    if (lua_type(L, -2) != LUA_TUSERDATA || lua_type(L, -1) != LUA_TUSERDATA) {
-        /* Lua 5.2+ calls __eq for any table/userdata pair; different types are
-         * simply not equal (Python answers the same for e.g. [] == 0). */
+    /* Lua 5.4+ runs __eq as soon as *one* operand carries it, so the other one
+     * may be an unrelated full userdata (a FILE*, a socket, ...). Reading that
+     * as a PyObject* would dereference whatever bytes it happens to hold, so
+     * both sides must be verified first — same reason isPythonObject() refuses
+     * a finalized interpreter. Anything that is not one of ours is simply not
+     * equal, which is what Python answers for e.g. [] == 0. */
+    if (!isPythonObject(L, -2) || !isPythonObject(L, -1)) {
         lua_pushboolean(L, 0);
         return 1;
     }

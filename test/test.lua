@@ -275,6 +275,13 @@ ok(not (builtins.list({ 1, 2 }) == builtins.list({ 1, 3 })), "不同内容不相
 ok(not (builtins.list({ 1 }) == luapython.dict { a = 1 }), "不同容器类型不相等")
 ok(not (builtins.list({ 1 }) == 1), "与 Lua 值比较返回 false 而不是报错")
 
+-- Lua 5.4+ 只要一侧带 __eq 就会调用它，所以对侧可以是任意 full userdata
+-- （FILE*、socket…）。把这坨内存当成 PyObject* 解引用，实测直接 SIGSEGV。
+local foreign = io.open("/dev/null")
+ok(not (builtins.list({ 1 }) == foreign), "与外部 userdata 比较返回 false 而不是崩溃（左侧）")
+ok(not (foreign == builtins.list({ 1 })), "与外部 userdata 比较返回 false 而不是崩溃（右侧）")
+foreign:close()
+
 --------------------------------------------------------------------------
 section("参数传递：尾部 nil 不再被吞掉")
 
@@ -331,9 +338,17 @@ end
 section("P0-7 finalize 之后不再崩溃（必须最后执行）")
 
 local survivor = builtins.list({ 1, 2, 3 })
+local survivor2 = builtins.list({ 1, 2, 3 })   -- 两个不同对象：同一个对象会被
+                                                -- Lua 按引用判定相等，根本不进 __eq
 luapython.finalize()
 local okc3, err3 = pcall(function() return #survivor end)
 ok(not okc3, "finalize 后访问对象抛出 Lua error 而不是崩溃", err3)
+
+-- __eq 会把两个句柄交给 PyObject_RichCompareBool；finalize 之后它们指向
+-- 已释放内存，所以必须在这里就放弃，而不是比较两坨垃圾
+local okc4, same = pcall(function() return survivor == survivor2 end)
+ok(okc4 and same == false, "finalize 后比较两个对象不崩溃", tostring(same))
+
 collectgarbage("collect")
 collectgarbage("collect")
 ok(true, "finalize 后 GC 不崩溃")
