@@ -122,11 +122,27 @@ current `.o` files were built against).
   keyword arguments when its keys are mostly strings. Pass containers as
   `luapython.dict{...}` / `luapython.list{...}` to be explicit, and note that a
   table mixing array and named keys is rejected rather than silently truncated.
+- **Table conversion is recursive and depth-limited.** A self-referential
+  table cannot be represented in Python, and nesting deeper than 200 levels is
+  rejected; both raise a Lua error instead of overflowing the C stack.
+- **Indexing merges `getattr` and `__getitem__`.** Lua has one indexing
+  operator, so `obj.name` and `obj[key]` are the same expression and the two
+  Python protocols cannot be told apart. An attribute is tried first, then
+  `obj[key]`; either way an absent key yields `nil`. That is what makes
+  `numpy.array{...}[1]`, `os.environ["PATH"]` and `range(10)[1]` work, and it
+  also makes `d.get(...)` reachable on a `luapython.dict` (item lookup still
+  wins, so a dict that really contains a `get` key is unaffected).
+  Dicts also support `for k, v in pairs(d)` on Lua 5.2+.
 - **One interpreter per process.** `luapython.load()` starts CPython; a second
   call (or a host that already embedded Python) raises instead of re-entering.
   `luapython.finalize()` releases it, after which every handle obtained earlier
   becomes inert: touching one raises a Lua error instead of dereferencing freed
-  memory.
+  memory. The interpreter cannot be started again afterwards -- `isFinalized()`
+  reports it, and `load()` / `initialize()` raise instead of pretending to
+  succeed.
+- **Python's buffered output is flushed at exit.** If the script never calls
+  `finalize()`, the library finalizes the interpreter from `atexit` so that
+  `print()` output is not lost when stdout is redirected to a file or a pipe.
 
 ## TODO
 
