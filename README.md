@@ -128,7 +128,9 @@ current `.o` files were built against).
 - **Indexing merges `getattr` and `__getitem__`.** Lua has one indexing
   operator, so `obj.name` and `obj[key]` are the same expression and the two
   Python protocols cannot be told apart. An attribute is tried first, then
-  `obj[key]`; either way an absent key yields `nil`. That is what makes
+  `obj[key]`; either way an absent key yields `nil`. Numeric subscripts are
+  1-based like `luapython.list` (`o[1]` is the first element, `o[-1]` the last),
+  so `range(10)[1]` is `0`. That is what makes
   `numpy.array{...}[1]`, `os.environ["PATH"]` and `range(10)[1]` work, and it
   also makes `d.get(...)` reachable on a `luapython.dict` (item lookup still
   wins, so a dict that really contains a `get` key is unaffected).

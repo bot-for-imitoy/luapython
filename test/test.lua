@@ -240,8 +240,13 @@ section("下标语义：getattr 之后回退 __getitem__")
 local collections = luapython.import "collections"
 local osmod = luapython.import "os"
 
-ok(builtins.range(0, 10)[2] == 2, "range 下标", tostring(builtins.range(0, 10)[2]))
-ok(collections.deque({ 1, 2, 3 })[1] == 2, "deque 下标", tostring(collections.deque({ 1, 2, 3 })[1]))
+-- 下标沿用 Lua 的 1-based 约定（和 luapython.list 一致），负数仍是 Python 语义
+ok(builtins.range(0, 10)[1] == 0, "range[1] 是第一个元素", tostring(builtins.range(0, 10)[1]))
+ok(builtins.range(0, 10)[2] == 1, "range[2] 是第二个元素", tostring(builtins.range(0, 10)[2]))
+ok(builtins.range(0, 10)[0] == nil, "range[0] 是 nil")
+ok(builtins.range(0, 10)[-1] == 9, "range[-1] 是最后一个元素", tostring(builtins.range(0, 10)[-1]))
+ok(collections.deque({ 1, 2, 3 })[1] == 1, "deque[1] 是第一个元素",
+   tostring(collections.deque({ 1, 2, 3 })[1]))
 ok(osmod.environ["PATH"] ~= nil, "os.environ 字符串下标取值")
 ok(osmod.environ["PATH"] == osmod.environ.get("PATH"), "environ 与 get() 结果一致")
 

@@ -386,7 +386,24 @@ int luapython_index_shared(lua_State* L, PyObject* obj, int keyidx) {
             PyErr_Clear();           /* maybe it is a subscript after all */
         }
     } else if (key_type == LUA_TNUMBER) {
-        key = luapython_number_to_py(L, keyidx);
+        /* Lua indices are 1-based, exactly like luapython.list: o[1] is the
+         * first element. Negative indices keep Python's meaning so that
+         * o[-1] is the last one. Passing the raw number through would make
+         * range(10)[1] and list{...}[1] disagree by one. */
+        lua_Number num = lua_tonumber(L, keyidx);
+        if (num == 0) {
+            lua_pushnil(L);          /* a Lua sequence has no element 0 */
+            return 1;
+        }
+        if (num > 0) {
+            num -= 1;
+        }
+        if (num > -9223372036854775808.0 && num < 9223372036854775808.0 &&
+            num == (lua_Number)(long long)num) {
+            key = PyLong_FromLongLong((long long)num);
+        } else {
+            key = PyFloat_FromDouble((double)num);
+        }
         if (key == NULL) {
             PyErr_Clear();
             lua_pushnil(L);
