@@ -54,6 +54,8 @@ int pushTupleLua(lua_State* L, PyObject* obj) {
         lua_setfield(L, -2, "__tostring");
         lua_pushcfunction(L, python_gc);
         lua_setfield(L, -2, "__gc");
+        lua_pushcfunction(L, python_object_eq);
+        lua_setfield(L, -2, "__eq");
         luapython_register_metatable(L);
     }
     lua_setmetatable(L, -2);

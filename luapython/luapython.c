@@ -1,5 +1,12 @@
 #include "luapython.h"
 
+#include <stdlib.h>
+
+/* Set once Py_Finalize() has run. Every handle handed to Lua before that point
+ * is a dangling pointer; this flag keeps isPythonObject() from trusting them
+ * even if somebody manages to start an interpreter again. */
+static int g_finalized = 0;
+
 /* ------------------------------------------------------------------------- */
 /* diagnostics                                                               */
 /* ------------------------------------------------------------------------- */
@@ -137,7 +144,7 @@ int isPythonObject(lua_State* L, int index) {
     if (lua_type(L, index) != LUA_TUSERDATA) {
         return 0;
     }
-    if (!Py_IsInitialized()) {
+    if (!Py_IsInitialized() || g_finalized) {
         /* The interpreter is gone: every handle we own points into freed
          * memory, so refuse to touch it instead of crashing. */
         return 0;
@@ -157,17 +164,46 @@ int isPythonObject(lua_State* L, int index) {
 /* module level functions                                                    */
 /* ------------------------------------------------------------------------- */
 
+/* Python's sys.stdout/sys.stderr are block-buffered as soon as they are not a
+ * terminal, and CPython only flushes them in Py_FinalizeEx(). A Lua script
+ * that never calls luapython.finalize() therefore used to lose every line
+ * print()ed by Python code when its output was redirected to a file or a pipe.
+ * Finalizing at process exit flushes them (and runs Python's own atexit
+ * handlers) exactly once. */
+static void luapython_flush_at_exit(void) {
+    if (Py_IsInitialized()) {
+        Py_FinalizeEx();
+    }
+}
+
 static int python_initialize(lua_State* L) {
     if (Py_IsInitialized()) {
         return luaL_error(L,
             "python_initialize: the Python interpreter is already running "
             "(started by the host program or by an earlier luapython.load())");
     }
+    if (g_finalized) {
+        /* Handles obtained before finalize() are dangling; restarting would
+         * make isPythonObject() trust them again. */
+        return luaL_error(L,
+            "python_initialize: the interpreter was finalized earlier in this "
+            "process and cannot be restarted");
+    }
     Py_Initialize();
     if (!Py_IsInitialized()) {
         return luaL_error(L, "python_initialize: Py_Initialize() failed");
     }
+    static int atexit_registered = 0;
+    if (!atexit_registered) {
+        atexit(luapython_flush_at_exit);
+        atexit_registered = 1;
+    }
     return 0;
+}
+
+static int python_is_finalized(lua_State* L) {
+    lua_pushboolean(L, g_finalized);
+    return 1;
 }
 
 static int python_finalize(lua_State* L) {
@@ -178,6 +214,7 @@ static int python_finalize(lua_State* L) {
      * reports 0 and python_gc() becomes a no-op once Py_Finalize() has run,
      * so surviving objects degrade into inert userdata instead of
      * dereferencing freed memory. */
+    g_finalized = 1;
     Py_Finalize();
     return 0;
 }
@@ -287,7 +324,7 @@ int python_gc(lua_State* L) {
     if (lua_type(L, -1) != LUA_TUSERDATA) {
         return 0;
     }
-    if (!Py_IsInitialized()) {
+    if (!Py_IsInitialized() || g_finalized) {
         /* Interpreter already finalized: the object is freed memory. Leaking
          * here is the only safe option, and the process is going away. */
         return 0;
@@ -312,32 +349,106 @@ static const char* key_from_lua(lua_State* L, int index) {
     return lua_tostring(L, index);
 }
 
+/* Shared __index implementation. Lua has a single indexing operator, so
+ * `o.k` and `o[k]` are indistinguishable here and Python's getattr and
+ * __getitem__ protocols have to be merged: try the attribute first, then the
+ * item. Without the second step every object that only implements
+ * __getitem__ (numpy arrays, range, os.environ, collections.deque, ...)
+ * silently produced nil, which is both wrong and very hard to debug.
+ *
+ * A number key skips the attribute lookup: no attribute name can start with a
+ * digit, so obj["1"] would fail anyway.
+ *
+ * "Not found" stays nil, as before: KeyError/IndexError/TypeError from the
+ * item lookup mean the key is absent, not that the operation is broken. */
+int luapython_index_shared(lua_State* L, PyObject* obj, int keyidx) {
+    int key_type = lua_type(L, keyidx);
+    PyObject* key = NULL;
+    PyObject* value = NULL;
+    const char* name = NULL;
+
+    if (key_type == LUA_TSTRING) {
+        size_t len;
+        const char* text = lua_tolstring(L, keyidx, &len);
+        name = text;
+        key = PyUnicode_FromStringAndSize(text, (Py_ssize_t)len);
+        if (key == NULL) {
+            PyErr_Clear();
+            lua_pushnil(L);
+            return 1;
+        }
+        value = PyObject_GetAttr(obj, key);
+        if (value == NULL) {
+            if (!PyErr_ExceptionMatches(PyExc_AttributeError)) {
+                Py_DECREF(key);
+                return luapython_throw(L, name);
+            }
+            PyErr_Clear();           /* maybe it is a subscript after all */
+        }
+    } else if (key_type == LUA_TNUMBER) {
+        key = luapython_number_to_py(L, keyidx);
+        if (key == NULL) {
+            PyErr_Clear();
+            lua_pushnil(L);
+            return 1;
+        }
+        name = "index";
+    } else {
+        return luaL_error(L, "attribute name must be a string, got %s",
+                          luaL_typename(L, keyidx));
+    }
+
+    if (value == NULL) {
+        value = PyObject_GetItem(obj, key);
+        if (value == NULL) {
+            if (PyErr_ExceptionMatches(PyExc_KeyError) ||
+                PyErr_ExceptionMatches(PyExc_IndexError) ||
+                PyErr_ExceptionMatches(PyExc_TypeError)) {
+                PyErr_Clear();
+                Py_DECREF(key);
+                lua_pushnil(L);
+                return 1;
+            }
+            Py_DECREF(key);
+            return luapython_throw(L, name);
+        }
+    }
+    Py_DECREF(key);
+    pushLua(L, value);   /* consumes */
+    return 1;
+}
+
 int python_index(lua_State* L) {
     if (!isPythonObject(L, -2)) {
         return luaL_error(L, "python_index: attempt to index a %s value", luaL_typename(L, -2));
-    }
-    const char* key = key_from_lua(L, -1);
-    if (key == NULL) {
-        return luaL_error(L, "python_index: attribute name must be a string, got %s",
-                          luaL_typename(L, -1));
     }
     PyObject* obj = *(PyObject**)lua_touserdata(L, -2);
     if (obj == NULL) {
         return luaL_error(L, "python_index: the Python object is no longer valid");
     }
-    PyObject* attr = PyObject_GetAttrString(obj, key);
-    if (attr == NULL) {
-        /* Same contract as Python's getattr(obj, name, None): a missing
-         * attribute yields nil, but an exception raised *inside* a property
-         * is a real error and must not be swallowed. */
-        if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
-            PyErr_Clear();
-            lua_pushnil(L);
-            return 1;
-        }
-        return luapython_throw(L, key);
+    return luapython_index_shared(L, obj, -1);
+}
+
+/* __eq shared by every container/object metatable. Without it Lua compares
+ * userdata by reference, so two equal Python lists compared unequal. */
+int python_object_eq(lua_State* L) {
+    if (lua_type(L, -2) != LUA_TUSERDATA || lua_type(L, -1) != LUA_TUSERDATA) {
+        /* Lua 5.2+ calls __eq for any table/userdata pair; different types are
+         * simply not equal (Python answers the same for e.g. [] == 0). */
+        lua_pushboolean(L, 0);
+        return 1;
     }
-    pushLua(L, attr);   /* consumes */
+    PyObject* left = *(PyObject**)lua_touserdata(L, -2);
+    PyObject* right = *(PyObject**)lua_touserdata(L, -1);
+    if (left == NULL || right == NULL) {
+        lua_pushboolean(L, left == right);
+        return 1;
+    }
+    int result = PyObject_RichCompareBool(left, right, Py_EQ);
+    if (result < 0) {
+        return luapython_throw(L, "eq (==)");
+    }
+    lua_pushboolean(L, result);
     return 1;
 }
 
@@ -377,13 +488,16 @@ int python_addr(lua_State* L) {
 
 int pushLua(lua_State* L, PyObject* obj) {
     if (obj == NULL || obj == Py_None) {
-        /* None/True/False are singletons: no DECREF needed, and callers may
-         * pass them without owning a reference. */
+        /* None has no Lua equivalent: nil is the closest match. The reference
+         * is still consumed, as documented, so callers do not have to special
+         * case it (it is merely a no-op for immortal singletons on 3.12+). */
+        Py_XDECREF(obj);
         lua_pushnil(L);
         return 1;
     }
     if (PyBool_Check(obj)) {
         lua_pushboolean(L, obj == Py_True);
+        Py_DECREF(obj);
         return 1;
     }
     if (PyNumber_Check(obj)) {
@@ -435,7 +549,14 @@ PyObject* luapython_number_to_py(lua_State* L, int index) {
     return PyFloat_FromDouble(value);
 }
 
-PyObject* convertPython(lua_State* L, int index) {
+PyObject* convertPythonAt(lua_State* L, int index, int depth) {
+    if (depth > LUAPYTHON_MAX_NESTING) {
+        /* A cyclic table would recurse until the C stack is exhausted and the
+         * process dies in a segfault; report it as an ordinary Lua error. */
+        luaL_error(L, "convertPython: table nested more than %d levels deep "
+                      "(cyclic table?)", LUAPYTHON_MAX_NESTING);
+        return NULL;
+    }
     /* Normalise to an absolute index: the table branch pushes values, and a
      * negative index would silently point somewhere else afterwards. */
     if (index < 0) {
@@ -488,12 +609,16 @@ PyObject* convertPython(lua_State* L, int index) {
         int is_dict = lua_toboolean(L, -1);
         lua_pop(L, 1);
         if (is_dict) {
-            return convertDictPython(L, index);
+            return convertDictPythonAt(L, index, depth);
         }
-        return convertListPython(L, index);
+        return convertListPythonAt(L, index, depth);
     }
     luaL_error(L, "convertPython: unsupported Lua type %s", luaL_typename(L, index));
     return NULL;
+}
+
+PyObject* convertPython(lua_State* L, int index) {
+    return convertPythonAt(L, index, 0);
 }
 
 int luaopen_luapython_core(lua_State* L) {
@@ -531,6 +656,8 @@ int luaopen_luapython_core(lua_State* L) {
     lua_setfield(L, -2, "initialize");
     lua_pushcfunction(L, python_finalize);
     lua_setfield(L, -2, "finalize");
+    lua_pushcfunction(L, python_is_finalized);
+    lua_setfield(L, -2, "isFinalized");
     lua_pushcfunction(L, python_addr);
     lua_setfield(L, -2, "addr");
     return 1;

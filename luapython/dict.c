@@ -6,7 +6,10 @@
  * Returns a new reference or NULL. */
 static PyObject* dict_operand(lua_State* L, int index) {
     if (lua_type(L, index) == LUA_TTABLE) {
-        return convertPython(L, index);
+        /* Must be the dict converter: convertPython() turns a table with
+         * integer keys into a *list*, which PyDict_Copy() then rejects with a
+         * confusing "'list' object has no attribute 'keys'". */
+        return convertDictPython(L, index);
     }
     if (isPythonDict(L, index)) {
         PyObject* dict = *(PyObject**)lua_touserdata(L, index);
@@ -46,17 +49,71 @@ int dict_index(lua_State* L) {
     }
     PyObject* value = PyDict_GetItemWithError(dict, key);   /* borrowed */
     Py_DECREF(key);
-    if (value == NULL) {
-        if (PyErr_Occurred()) {
-            return luapython_throw(L, "dict_index");
-        }
-        lua_pushnil(L);
+    if (value != NULL) {
+        Py_XINCREF(value);
+        pushLua(L, value);   /* consumes */
         return 1;
     }
-    Py_XINCREF(value);
-    pushLua(L, value);   /* consumes */
+    if (PyErr_Occurred()) {
+        return luapython_throw(L, "dict_index");
+    }
+    /* The key is absent. `d.keys` and `d["keys"]` are the same expression in
+     * Lua, so try an attribute before answering nil - otherwise every dict
+     * method (get, keys, items, ...) is unreachable from the dot syntax. Item
+     * lookup still wins, so a dict that really has a "keys" entry is
+     * unaffected. */
+    if (lua_type(L, -1) == LUA_TSTRING) {
+        return luapython_index_shared(L, dict, -1);
+    }
+    lua_pushnil(L);
     return 1;
 }
+
+#if LUA_VERSION_NUM >= 502
+/* Step function of `for k, v in pairs(pydict) do`. The traversal cursor lives
+ * in an upvalue: a generic `for` feeds the *first* returned value back as the
+ * control variable, so the cursor cannot be passed through the loop itself
+ * (returning it as a third value made the loop restart forever).
+ *
+ * Upvalues of the running C closure: 1 = the dict, 2 = the cursor. A dict
+ * modified during traversal behaves like a Lua table modified during
+ * traversal: unspecified, but memory safe (we hold a reference to the dict). */
+static int dict_pairs_iter(lua_State* L) {
+    if (!isPythonDict(L, lua_upvalueindex(1))) {
+        return luaL_error(L, "dict_pairs: bad state, expected a dict");
+    }
+    PyObject* dict = *(PyObject**)lua_touserdata(L, lua_upvalueindex(1));
+    if (dict == NULL) {
+        return luaL_error(L, "dict_pairs: the Python dict is no longer valid");
+    }
+    Py_ssize_t pos = (Py_ssize_t)lua_tointeger(L, lua_upvalueindex(2));
+    PyObject* key;
+    PyObject* value;
+    if (!PyDict_Next(dict, &pos, &key, &value)) {
+        lua_pushnil(L);            /* end of traversal */
+        return 1;
+    }
+    lua_pushinteger(L, (lua_Integer)pos);
+    lua_replace(L, lua_upvalueindex(2));   /* remember where to continue */
+    Py_XINCREF(key);
+    pushLua(L, key);               /* consumes */
+    Py_XINCREF(value);
+    pushLua(L, value);             /* consumes */
+    return 2;
+}
+
+int dict_pairs(lua_State* L) {
+    if (!isPythonDict(L, -1)) {
+        return luaL_error(L, "dict_pairs: attempt to iterate %s", luaL_typename(L, -1));
+    }
+    lua_pushvalue(L, -1);                 /* upvalue 1: the dict */
+    lua_pushinteger(L, 0);                /* upvalue 2: cursor */
+    lua_pushcclosure(L, dict_pairs_iter, 2);
+    lua_pushvalue(L, -2);                 /* state (unused by the iterator) */
+    lua_pushnil(L);                       /* control */
+    return 3;
+}
+#endif
 
 int dict_newindex(lua_State* L) {
     if (!isPythonDict(L, -3)) {
@@ -196,13 +253,19 @@ int pushDictLua(lua_State* L, PyObject* obj) {
         lua_setfield(L, -2, "__tostring");
         lua_pushcfunction(L, python_gc);
         lua_setfield(L, -2, "__gc");
+        lua_pushcfunction(L, python_object_eq);
+        lua_setfield(L, -2, "__eq");
+#if LUA_VERSION_NUM >= 502
+        lua_pushcfunction(L, dict_pairs);
+        lua_setfield(L, -2, "__pairs");
+#endif
         luapython_register_metatable(L);
     }
     lua_setmetatable(L, -2);
     return 1;
 }
 
-PyObject* convertDictPython(lua_State* L, int index) {
+PyObject* convertDictPythonAt(lua_State* L, int index, int depth) {
     if (lua_type(L, index) == LUA_TTABLE) {
         PyObject* dict = PyDict_New();
         if (dict == NULL) {
@@ -211,8 +274,8 @@ PyObject* convertDictPython(lua_State* L, int index) {
         lua_pushvalue(L, index);
         lua_pushnil(L);
         while (lua_next(L, -2) != 0) {
-            PyObject* key = convertPython(L, -2);
-            PyObject* value = convertPython(L, -1);
+            PyObject* key = convertPythonAt(L, -2, depth + 1);
+            PyObject* value = convertPythonAt(L, -1, depth + 1);
             lua_pop(L, 1);                   /* pop the value, keep the key */
             if (key == NULL || value == NULL) {
                 Py_XDECREF(key);
@@ -246,4 +309,8 @@ PyObject* convertDictPython(lua_State* L, int index) {
     luaL_error(L, "convertDictPython: expected a table or dict at index %d, got %s",
                index, luaL_typename(L, index));
     return NULL;
+}
+
+PyObject* convertDictPython(lua_State* L, int index) {
+    return convertDictPythonAt(L, index, 0);
 }

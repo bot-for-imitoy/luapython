@@ -1,5 +1,5 @@
--- Regression tests for the P0 bugs listed in the code review.
--- Run with: make test          (or see test/run.sh for a manual setup)
+-- Regression tests for the bugs found in the code reviews.
+-- Run with: make test         (or see the TEST_ENV variable in the Makefile)
 
 local pass, fail, skip = 0, 0, 0
 
@@ -233,6 +233,92 @@ end
 ok(#collected == 3 and collected[1] == 1 and collected[3] == 3, "for ... in pyiter()")
 
 --------------------------------------------------------------------------
+section("下标语义：getattr 之后回退 __getitem__")
+
+-- 只实现 __getitem__ 的对象以前下标一律返回 nil（静默错误），
+-- 典型受害者：numpy 数组、range、os.environ、collections.deque
+local collections = luapython.import "collections"
+local osmod = luapython.import "os"
+
+ok(builtins.range(0, 10)[2] == 2, "range 下标", tostring(builtins.range(0, 10)[2]))
+ok(collections.deque({ 1, 2, 3 })[1] == 2, "deque 下标", tostring(collections.deque({ 1, 2, 3 })[1]))
+ok(osmod.environ["PATH"] ~= nil, "os.environ 字符串下标取值")
+ok(osmod.environ["PATH"] == osmod.environ.get("PATH"), "environ 与 get() 结果一致")
+
+-- dict 的 key 查找优先，缺失时才回退到属性，所以 d.keys / d.get 可用
+local d1 = luapython.dict { a = 1 }
+ok(d1.get("a") == 1, "dict 属性形式的方法调用", tostring(d1.get and d1.get("a")))
+ok(d1.keys ~= nil, "dict.keys 可访问")
+ok(#luapython.astable(d1.keys()) == 1, "dict.keys() 可以调用")
+ok(d1.nope == nil, "缺失 key 仍返回 nil（不抛异常）")
+local shadow = luapython.dict { get = 7 }
+ok(shadow.get == 7, "同名 key 优先于方法", tostring(shadow.get))
+
+--------------------------------------------------------------------------
+section("容器 / 对象的相等语义")
+
+-- 没有 __eq 时 Lua 按引用比较，两个相等的 Python 容器以前恒为 false
+ok(builtins.list({ 1, 2 }) == builtins.list({ 1, 2 }), "list == list")
+ok(luapython.dict { a = 1 } == luapython.dict { a = 1 }, "dict == dict")
+ok(luapython.tuple({ 1, 2 }) == luapython.tuple({ 1, 2 }), "tuple == tuple")
+ok(builtins.set({ 1, 2 }) == builtins.set({ 1, 2 }), "set == set")
+ok(not (builtins.list({ 1, 2 }) == builtins.list({ 1, 3 })), "不同内容不相等")
+ok(not (builtins.list({ 1 }) == luapython.dict { a = 1 }), "不同容器类型不相等")
+ok(not (builtins.list({ 1 }) == 1), "与 Lua 值比较返回 false 而不是报错")
+
+--------------------------------------------------------------------------
+section("参数传递：尾部 nil 不再被吞掉")
+
+-- `{...}` 记不住尾部的 nil（#{1,nil} 是 1、#{nil} 是 0），
+-- 所以 f(1, nil) 曾被悄悄改成 f(1)
+ok(json.dumps(nil) == "null", "json.dumps(nil) == 'null'", json.dumps(nil))
+ok(builtins.repr(nil) == "None", "repr(nil) == 'None'", builtins.repr(nil))
+ok(select("#", builtins.repr(nil)) == 1, "只有一个返回值")
+local ok_nil, err_nil = pcall(function() return builtins.len(nil) end)
+ok(not ok_nil and tostring(err_nil):match("NoneType"),
+   "nil 真的作为 None 传给了 Python", err_nil)
+
+--------------------------------------------------------------------------
+section("运算符的 table 操作数")
+
+-- convertPython 会把纯数字键的 table 变成 list，于是 s + {3} 报
+-- "unsupported operand type(s) for |: 'set' and 'list'"
+local ss = builtins.set({ 1, 2 })
+ok(#(ss + { 3 }) == 3, "set + table 是并集", tostring(ss + { 3 }))
+ok(#(ss * { 2 }) == 1, "set * table 是交集", tostring(ss * { 2 }))
+ok(#(ss - { 1 }) == 1, "set - table 是差集", tostring(ss - { 1 }))
+ok((luapython.dict { a = 1 } + { b = 2 }).b == 2, "dict + table 合并")
+
+--------------------------------------------------------------------------
+section("环形 / 超深 table 不再崩溃")
+
+local cyclic = {}
+cyclic[1] = cyclic
+local ok_cyc, err_cyc = pcall(luapython.list, cyclic)
+ok(not ok_cyc and tostring(err_cyc):match("nested"),
+   "环形 list 报 Lua error 而不是段错误", err_cyc)
+
+local cyclic_dict = {}
+cyclic_dict.self = cyclic_dict
+local ok_cyd, err_cyd = pcall(luapython.dict, cyclic_dict)
+ok(not ok_cyd and tostring(err_cyd):match("nested"),
+   "环形 dict 报 Lua error 而不是段错误", err_cyd)
+
+local deep = { 1 }
+for _ = 1, 50 do deep = { deep } end
+ok(pcall(luapython.list, deep), "50 层嵌套仍然可以正常转换")
+
+if LUA_VER >= 5.2 then
+    local walked = {}
+    for key, value in pairs(luapython.dict { a = 1, b = 2 }) do
+        walked[key] = value
+    end
+    ok(walked.a == 1 and walked.b == 2, "for k, v in pairs(pydict)")
+else
+    skipped("pairs(pydict)（Lua 5.1 不支持 __pairs）")
+end
+
+--------------------------------------------------------------------------
 section("P0-7 finalize 之后不再崩溃（必须最后执行）")
 
 local survivor = builtins.list({ 1, 2, 3 })
@@ -242,6 +328,15 @@ ok(not okc3, "finalize 后访问对象抛出 Lua error 而不是崩溃", err3)
 collectgarbage("collect")
 collectgarbage("collect")
 ok(true, "finalize 后 GC 不崩溃")
+
+-- 重新启动解释器会让旧句柄重新被当成有效对象（use-after-free）
+ok(luapython.isFinalized() == true, "isFinalized() 为真")
+local ok_init, err_init = pcall(luapython.initialize)
+ok(not ok_init and tostring(err_init):match("finalized"),
+   "finalize 之后 initialize 被拒绝", err_init)
+local ok_load, err_load = pcall(luapython.load)
+ok(not ok_load and tostring(err_load):match("finalized"),
+   "finalize 之后 load() 明确报错（不再假装成功）", err_load)
 
 --------------------------------------------------------------------------
 io.write(string.format("\n%d passed, %d failed, %d skipped\n", pass, fail, skip))

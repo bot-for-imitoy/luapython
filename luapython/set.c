@@ -6,7 +6,10 @@
  * Returns a new reference or NULL. */
 static PyObject* set_operand(lua_State* L, int index) {
     if (lua_type(L, index) == LUA_TTABLE) {
-        return convertPython(L, index);
+        /* Must be the set converter: convertPython() turns a table with
+         * integer keys into a *list*, so `s + {3}` used to fail with
+         * "unsupported operand type(s) for |: 'set' and 'list'". */
+        return convertSetPython(L, index);
     }
     if (isPythonSet(L, index)) {
         PyObject* set = *(PyObject**)lua_touserdata(L, index);
@@ -126,6 +129,8 @@ int pushSetLua(lua_State* L, PyObject* obj) {
         lua_setfield(L, -2, "__tostring");
         lua_pushcfunction(L, python_gc);
         lua_setfield(L, -2, "__gc");
+        lua_pushcfunction(L, python_object_eq);
+        lua_setfield(L, -2, "__eq");
         luapython_register_metatable(L);
     }
     lua_setmetatable(L, -2);

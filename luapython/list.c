@@ -182,13 +182,15 @@ int pushListLua(lua_State* L, PyObject* obj) {
         lua_setfield(L, -2, "__tostring");
         lua_pushcfunction(L, python_gc);
         lua_setfield(L, -2, "__gc");
+        lua_pushcfunction(L, python_object_eq);
+        lua_setfield(L, -2, "__eq");
         luapython_register_metatable(L);
     }
     lua_setmetatable(L, -2);
     return 1;
 }
 
-PyObject* convertListPython(lua_State* L, int index) {
+PyObject* convertListPythonAt(lua_State* L, int index, int depth) {
     if (lua_type(L, index) == LUA_TTABLE) {
         lua_Integer len = (lua_Integer)lua_rawlen(L, index);
 
@@ -219,7 +221,7 @@ PyObject* convertListPython(lua_State* L, int index) {
         }
         for (lua_Integer i = 1; i <= len; i++) {
             lua_rawgeti(L, index, (int)i);
-            PyObject* item = convertPython(L, -1);
+            PyObject* item = convertPythonAt(L, -1, depth + 1);
             lua_pop(L, 1);
             if (item == NULL) {
                 Py_DECREF(list);
@@ -237,4 +239,8 @@ PyObject* convertListPython(lua_State* L, int index) {
     luaL_error(L, "convertListPython: expected a table or list at index %d, got %s",
                index, luaL_typename(L, index));
     return NULL;
+}
+
+PyObject* convertListPython(lua_State* L, int index) {
+    return convertListPythonAt(L, index, 0);
 }
