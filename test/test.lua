@@ -181,12 +181,16 @@ local function rss_kb()
     return tonumber(text:match("VmRSS:%s*(%d+)"))
 end
 
--- valgrind 会用 redzone 和影子内存抬高 RSS，这个指标在它下面没有意义。
-local under_valgrind = (os.getenv("LD_PRELOAD") or ""):lower():find("valgrind", 1, true) ~= nil
+-- valgrind 会用 redzone 和影子内存抬高 RSS；ASan 换掉了 malloc 并保留
+-- quarantine（默认能攒到上百 MB），两者下面这个指标都没有意义。
+local preload = (os.getenv("LD_PRELOAD") or ""):lower()
+local under_sanitizer = preload:find("valgrind", 1, true) ~= nil
+    or preload:find("libasan", 1, true) ~= nil
+    or preload:find("libclang_rt.asan", 1, true) ~= nil
 
 local before = rss_kb()
-if under_valgrind then
-    skipped("30 万次 float 返回不涨 RSS（valgrind 下 RSS 不可信）")
+if under_sanitizer then
+    skipped("30 万次 float 返回不涨 RSS（valgrind/ASan 下 RSS 不可信）")
 elseif before then
     for i = 1, 300000 do
         local _ = math.sqrt(i)
